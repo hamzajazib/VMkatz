@@ -1,0 +1,25 @@
+[package]
+name = "vmkatz"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["vmware", "vbox", "sam"]
+vmware = ["dep:memmap2"]
+vbox = []
+sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
+
+[dependencies]
+memmap2 = { version = "0.9", optional = true }
+ntfs = { version = "0.4", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+aes = "0.8"
+des = "0.8"
+cbc = "0.1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+log = "0.4"
+env_logger = "0.11"

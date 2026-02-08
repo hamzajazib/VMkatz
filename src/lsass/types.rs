@@ -1,0 +1,207 @@
+/// Aggregated credential for a logon session.
+#[derive(Debug)]
+pub struct Credential {
+    pub luid: u64,
+    pub username: String,
+    pub domain: String,
+    pub logon_type: u32,
+    pub session_id: u32,
+    pub msv: Option<MsvCredential>,
+    pub wdigest: Option<WdigestCredential>,
+    pub kerberos: Option<KerberosCredential>,
+    pub tspkg: Option<TspkgCredential>,
+    pub dpapi: Vec<DpapiCredential>,
+    pub credman: Vec<CredmanCredential>,
+    pub ssp: Option<SspCredential>,
+    pub livessp: Option<LiveSspCredential>,
+    pub cloudap: Option<CloudApCredential>,
+}
+
+/// MSV1_0 credential: NTLM hashes.
+#[derive(Debug, Clone)]
+pub struct MsvCredential {
+    pub username: String,
+    pub domain: String,
+    pub lm_hash: [u8; 16],
+    pub nt_hash: [u8; 16],
+    pub sha1_hash: [u8; 20],
+}
+
+/// WDigest credential: plaintext password.
+#[derive(Debug)]
+pub struct WdigestCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+}
+
+/// Kerberos credential.
+#[derive(Debug)]
+pub struct KerberosCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+}
+
+/// TsPkg credential.
+#[derive(Debug)]
+pub struct TspkgCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+}
+
+/// DPAPI master key cache entry.
+#[derive(Debug)]
+pub struct DpapiCredential {
+    pub guid: String,
+    pub key: Vec<u8>,
+    pub key_size: u32,
+}
+
+/// Credential Manager saved credential.
+#[derive(Debug)]
+pub struct CredmanCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+    pub target: String,
+}
+
+/// SSP credential (custom SSP).
+#[derive(Debug)]
+pub struct SspCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+}
+
+/// LiveSSP credential (Microsoft Account).
+#[derive(Debug)]
+pub struct LiveSspCredential {
+    pub username: String,
+    pub domain: String,
+    pub password: String,
+}
+
+/// CloudAP credential (Azure AD).
+#[derive(Debug)]
+pub struct CloudApCredential {
+    pub username: String,
+    pub domain: String,
+    pub dpapi_key: Vec<u8>,
+    pub prt: String,
+}
+
+impl Credential {
+    pub fn new_empty(luid: u64, username: String, domain: String) -> Self {
+        Credential {
+            luid,
+            username,
+            domain,
+            logon_type: 0,
+            session_id: 0,
+            msv: None,
+            wdigest: None,
+            kerberos: None,
+            tspkg: None,
+            dpapi: Vec::new(),
+            credman: Vec::new(),
+            ssp: None,
+            livessp: None,
+            cloudap: None,
+        }
+    }
+
+    /// Returns true if this credential has any useful extracted data.
+    pub fn has_credentials(&self) -> bool {
+        self.msv.is_some()
+            || self.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
+            || self.kerberos.as_ref().is_some_and(|k| !k.password.is_empty())
+            || self.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
+            || !self.dpapi.is_empty()
+            || !self.credman.is_empty()
+            || self.ssp.as_ref().is_some_and(|s| !s.password.is_empty())
+            || self.livessp.as_ref().is_some_and(|l| !l.password.is_empty())
+            || self.cloudap.is_some()
+    }
+}
+
+impl std::fmt::Display for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let luid_label = match self.luid {
+            0x3e7 => " (SYSTEM)",
+            0x3e4 => " (NETWORK SERVICE)",
+            0x3e5 => " (LOCAL SERVICE)",
+            0x3e3 => " (IUSER)",
+            _ => "",
+        };
+        writeln!(f, "  LUID: 0x{:x}{}", self.luid, luid_label)?;
+        writeln!(f, "  Username: {}", self.username)?;
+        writeln!(f, "  Domain: {}", self.domain)?;
+        if !self.has_credentials() {
+            writeln!(f, "  (no credentials extracted - paged out)")?;
+            return Ok(());
+        }
+        if let Some(msv) = &self.msv {
+            writeln!(f, "  [MSV1_0]")?;
+            writeln!(f, "    LM Hash : {}", hex::encode(msv.lm_hash))?;
+            writeln!(f, "    NT Hash : {}", hex::encode(msv.nt_hash))?;
+            writeln!(f, "    SHA1    : {}", hex::encode(msv.sha1_hash))?;
+        }
+        if let Some(wd) = &self.wdigest {
+            if !wd.password.is_empty() {
+                writeln!(f, "  [WDigest]")?;
+                writeln!(f, "    Password: {}", wd.password)?;
+            }
+        }
+        if let Some(krb) = &self.kerberos {
+            writeln!(f, "  [Kerberos]")?;
+            writeln!(f, "    Password: {}", krb.password)?;
+        }
+        if let Some(ts) = &self.tspkg {
+            writeln!(f, "  [TsPkg]")?;
+            writeln!(f, "    Password: {}", ts.password)?;
+        }
+        if !self.dpapi.is_empty() {
+            writeln!(f, "  [DPAPI]")?;
+            for dk in &self.dpapi {
+                writeln!(f, "    GUID: {}", dk.guid)?;
+                writeln!(f, "    Key : {} ({} bytes)", hex::encode(&dk.key), dk.key_size)?;
+            }
+        }
+        if !self.credman.is_empty() {
+            writeln!(f, "  [CredMan]")?;
+            for cm in &self.credman {
+                writeln!(f, "    Target  : {}", cm.target)?;
+                writeln!(f, "    Username: {}", cm.username)?;
+                writeln!(f, "    Domain  : {}", cm.domain)?;
+                writeln!(f, "    Password: {}", cm.password)?;
+            }
+        }
+        if let Some(ssp) = &self.ssp {
+            writeln!(f, "  [SSP]")?;
+            writeln!(f, "    Username: {}", ssp.username)?;
+            writeln!(f, "    Domain  : {}", ssp.domain)?;
+            writeln!(f, "    Password: {}", ssp.password)?;
+        }
+        if let Some(live) = &self.livessp {
+            writeln!(f, "  [LiveSSP]")?;
+            writeln!(f, "    Username: {}", live.username)?;
+            writeln!(f, "    Domain  : {}", live.domain)?;
+            writeln!(f, "    Password: {}", live.password)?;
+        }
+        if let Some(cap) = &self.cloudap {
+            writeln!(f, "  [CloudAP]")?;
+            writeln!(f, "    Username : {}", cap.username)?;
+            writeln!(f, "    Domain   : {}", cap.domain)?;
+            if !cap.dpapi_key.is_empty() {
+                writeln!(f, "    DPAPI Key: {}", hex::encode(&cap.dpapi_key))?;
+            }
+            if !cap.prt.is_empty() {
+                writeln!(f, "    PRT      : {}", cap.prt)?;
+            }
+        }
+        Ok(())
+    }
+}
