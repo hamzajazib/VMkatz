@@ -1,5 +1,6 @@
 pub mod hive;
 pub mod bootkey;
+pub mod cache;
 pub mod hashes;
 pub mod lsa;
 mod ntfs_fallback;
@@ -24,11 +25,12 @@ pub struct SamEntry {
     pub lm_hash: [u8; 16],
 }
 
-/// Combined extraction result: SAM hashes + LSA secrets.
+/// Combined extraction result: SAM hashes + LSA secrets + cached credentials.
 #[derive(Debug)]
 pub struct DiskSecrets {
     pub sam_entries: Vec<SamEntry>,
     pub lsa_secrets: Vec<lsa::LsaSecret>,
+    pub cached_credentials: Vec<cache::CachedCredential>,
 }
 
 /// Extract SAM hashes from a disk image (backward-compatible wrapper).
@@ -158,9 +160,9 @@ fn process_hive_data_with_bootkey(
     let sam_entries = hashes::extract_hashes(&sam_data, &boot_key)?;
 
     // Extract LSA secrets from SECURITY hive (optional)
-    let lsa_secrets = if let Some(sec_data) = &security_data {
+    let (lsa_secrets, cached_credentials) = if let Some(sec_data) = &security_data {
         log::info!("SECURITY hive: {} bytes", sec_data.len());
-        match lsa::extract_lsa_secrets(sec_data, &boot_key) {
+        let secrets = match lsa::extract_lsa_secrets(sec_data, &boot_key) {
             Ok(secrets) => {
                 log::info!("Extracted {} LSA secrets", secrets.len());
                 secrets
@@ -169,16 +171,62 @@ fn process_hive_data_with_bootkey(
                 log::warn!("LSA secrets extraction failed: {}", e);
                 Vec::new()
             }
-        }
+        };
+
+        // Extract cached credentials (DCC2) using NL$KM from LSA secrets
+        let cached = extract_dcc2_from_secrets(sec_data, &secrets);
+
+        (secrets, cached)
     } else {
         log::info!("SECURITY hive not found, skipping LSA secrets");
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     Ok(DiskSecrets {
         sam_entries,
         lsa_secrets,
+        cached_credentials,
     })
+}
+
+/// Extract DCC2 cached credentials using NL$KM from LSA secrets.
+fn extract_dcc2_from_secrets(
+    security_data: &[u8],
+    secrets: &[lsa::LsaSecret],
+) -> Vec<cache::CachedCredential> {
+    // Find NL$KM key in LSA secrets
+    let nlkm_key = secrets.iter().find_map(|s| {
+        if let lsa::LsaSecretType::CachedDomainKey { key } = &s.parsed {
+            Some(key.as_slice())
+        } else {
+            None
+        }
+    });
+
+    let nlkm_key = match nlkm_key {
+        Some(k) if k.len() >= 32 => k,
+        Some(k) => {
+            log::info!("NL$KM key too short ({} bytes), skipping DCC2", k.len());
+            return Vec::new();
+        }
+        None => {
+            log::info!("NL$KM key not found in LSA secrets, skipping DCC2");
+            return Vec::new();
+        }
+    };
+
+    match cache::extract_cached_credentials(security_data, nlkm_key) {
+        Ok(creds) => {
+            if !creds.is_empty() {
+                log::info!("Extracted {} cached credential(s)", creds.len());
+            }
+            creds
+        }
+        Err(e) => {
+            log::warn!("DCC2 extraction failed: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 /// Parse MBR/GPT and find all NTFS partitions, returning their byte offsets.

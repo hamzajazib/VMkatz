@@ -285,7 +285,7 @@ fn expand_des_key(src: &[u8; 7]) -> [u8; 8] {
 }
 
 /// AES-128-CBC decryption (no padding).
-fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut buf = data.to_vec();
     // Pad to 16-byte boundary if needed (with zeros for decryption)
     let pad_len = (16 - (buf.len() % 16)) % 16;

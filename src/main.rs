@@ -154,6 +154,10 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
         print_lsa_secrets(&secrets.lsa_secrets);
     }
 
+    if !secrets.cached_credentials.is_empty() {
+        print_cached_credentials(&secrets.cached_credentials);
+    }
+
     Ok(())
 }
 
@@ -203,6 +207,14 @@ fn print_lsa_secrets(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
     println!("\n[+] LSA Secrets:");
     for secret in secrets {
         println!("{}", secret);
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_cached_credentials(creds: &[vmkatz::sam::cache::CachedCredential]) {
+    println!("\n[+] Domain Cached Credentials (DCC2):");
+    for cred in creds {
+        println!("{}", cred);
     }
 }
 
