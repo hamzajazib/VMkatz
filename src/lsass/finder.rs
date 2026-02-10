@@ -164,7 +164,6 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     let mut wdigest_status = "paged";
     let mut kerberos_status = "paged";
     let mut tspkg_status = "paged";
-    let dpapi_status;
     let mut ssp_status = "empty";
     let mut livessp_status = if dlls.livessp.is_some() { "paged" } else { "n/a" };
     let mut credman_status = "paged";
@@ -267,11 +266,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             crate::lsass::dpapi::extract_dpapi_physical_scan(phys, lsass.dtb, &lsass_vmem, &keys)
         }
     };
-    if dpapi_creds.is_empty() {
-        dpapi_status = "empty";
-    } else {
-        dpapi_status = "ok";
-    }
+    let dpapi_status = if dpapi_creds.is_empty() { "empty" } else { "ok" };
     for (luid, dpapi_cred) in dpapi_creds {
         let entry = all_creds.entry(luid).or_insert_with(|| {
             Credential::new_empty(luid, String::new(), String::new())

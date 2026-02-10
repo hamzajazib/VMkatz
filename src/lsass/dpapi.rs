@@ -426,7 +426,7 @@ fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
     // insertTime at +0x28: FILETIME should be a reasonable date (2000-2040)
     // High DWORD of FILETIME for year 2000 ≈ 0x01BF..., year 2040 ≈ 0x01E0...
     let ft_high = u32::from_le_bytes(page[off + 0x2C..off + 0x30].try_into().unwrap());
-    if ft_high < 0x01BF_0000 || ft_high > 0x01E0_0000 {
+    if !(0x01BF_0000..=0x01E0_0000).contains(&ft_high) {
         return false;
     }
     // key_size at +0x30: must be 32, 48, or 64

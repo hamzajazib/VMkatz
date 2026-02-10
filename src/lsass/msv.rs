@@ -1016,7 +1016,7 @@ fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Res
     for &addr in &lea_addrs {
         let val = vmem.read_virt_u32(addr).unwrap_or(0);
         // LogonSessionListCount is typically 64 or another small power-of-2
-        if val >= 4 && val <= 256 {
+        if (4..=256).contains(&val) {
             count = val as usize;
             log::info!("LogonSessionListCount at 0x{:x} = {}", addr, val);
         } else {
