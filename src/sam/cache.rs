@@ -209,11 +209,7 @@ pub fn extract_cached_credentials(
     Ok(credentials)
 }
 
-/// Pad a length to DWORD alignment (Windows-style: add len & 3 if not aligned).
+/// Round up to DWORD alignment.
 fn pad4(len: usize) -> usize {
-    if (len & 0x3) > 0 {
-        len + (len & 0x3)
-    } else {
-        len
-    }
+    (len + 3) & !3
 }
