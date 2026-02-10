@@ -136,9 +136,11 @@ pub fn extract_crypto_keys(
         return Ok(CryptoKeys { iv, des_key, aes_key });
     }
 
-    Err(GovmemError::PatternNotFound(
-        "Could not extract crypto keys with any known offset set".to_string(),
-    ))
+    // All offset sets failed (likely .data pages paged out → globals read as 0).
+    // Fall through to .data section scan which may find handles if some .data pages
+    // are accessible (transition PTEs).
+    log::info!("All offset sets failed, trying .data section fallback...");
+    extract_crypto_keys_data_fallback(vmem, lsasrv_base)
 }
 
 /// Fallback: scan lsasrv.dll's .data section for BCrypt key handles.
@@ -386,6 +388,197 @@ fn extract_bcrypt_key(vmem: &impl VirtualMemory, handle_addr: u64) -> Result<Vec
     Err(GovmemError::DecryptionError(
         "Could not locate HARD_KEY in BCrypt key structure".to_string(),
     ))
+}
+
+/// Physical scan fallback: find BCRYPT_HANDLE_KEY structures directly in LSASS pages.
+///
+/// When .data section globals are paged out (reading as 0), the actual BCrypt structures
+/// on the heap may still be in physical memory (present or transition pages). This function
+/// enumerates LSASS pages, finds UUUR-tagged handles, extracts keys, and resolves IV
+/// from the pattern-based RIP-relative address.
+pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
+    phys: &P,
+    vmem: &impl VirtualMemory,
+    lsass_dtb: u64,
+    lsasrv_base: u64,
+    _lsasrv_size: u32,
+) -> Result<CryptoKeys> {
+    use crate::paging::translate::PageTableWalker;
+
+    log::info!("Trying physical UUUR scan for BCRYPT handles in LSASS pages");
+
+    let walker = PageTableWalker::new(phys);
+    let mut uuur_vaddrs: Vec<u64> = Vec::new();
+
+    walker.enumerate_present_pages(lsass_dtb, |mapping| {
+        if mapping.size != 0x1000 {
+            return; // Only scan 4KB pages
+        }
+        let mut page = [0u8; 4096];
+        if phys.read_phys(mapping.paddr, &mut page).is_err() {
+            return;
+        }
+        // Scan for UUUR tag at 8-byte aligned positions
+        // BCRYPT_HANDLE_KEY: size(4) + tag(4=UUUR) at the start of the struct
+        for offset in (0..4096 - 8).step_by(8) {
+            let tag = u32::from_le_bytes(page[offset + 4..offset + 8].try_into().unwrap());
+            if tag == 0x5555_5552 {
+                // UUUR found
+                uuur_vaddrs.push(mapping.vaddr + offset as u64);
+            }
+        }
+    });
+
+    log::info!("Physical scan found {} UUUR candidates", uuur_vaddrs.len());
+
+    if uuur_vaddrs.is_empty() {
+        return Err(GovmemError::PatternNotFound(
+            "No BCRYPT_HANDLE_KEY (UUUR) found in LSASS pages".to_string(),
+        ));
+    }
+
+    // Extract keys from UUUR handles via virtual memory (handles transition pages)
+    let mut extracted_keys: Vec<(u64, Vec<u8>)> = Vec::new();
+    for &handle_va in &uuur_vaddrs {
+        // BCRYPT_HANDLE_KEY: key pointer at +0x10
+        let key_ptr = match vmem.read_virt_u64(handle_va + 0x10) {
+            Ok(p) if p > 0x10000 => p,
+            _ => continue,
+        };
+
+        // Try BCRYPT_KEY81 (hardkey at +0x38) and BCRYPT_KEY (hardkey at +0x18)
+        for &hardkey_off in &[0x38u64, 0x18] {
+            let cb_secret = match vmem.read_virt_u32(key_ptr + hardkey_off) {
+                Ok(cb) if cb == 16 || cb == 24 || cb == 32 => cb,
+                _ => continue,
+            };
+            if let Ok(data) = vmem.read_virt_bytes(key_ptr + hardkey_off + 4, cb_secret as usize) {
+                if data.iter().any(|&b| b != 0) {
+                    log::info!(
+                        "Physical scan: key at UUUR 0x{:x} → key_obj 0x{:x}+0x{:x}: {} bytes",
+                        handle_va, key_ptr, hardkey_off, cb_secret,
+                    );
+                    extracted_keys.push((handle_va, data));
+                    break;
+                }
+            }
+        }
+    }
+
+    log::info!("Physical scan extracted {} keys from UUUR handles", extracted_keys.len());
+
+    if extracted_keys.len() < 2 {
+        return Err(GovmemError::PatternNotFound(format!(
+            "Physical scan found {} UUUR handles but only {} valid keys (need 2)",
+            uuur_vaddrs.len(),
+            extracted_keys.len(),
+        )));
+    }
+
+    // Identify 3DES (24B) and AES (16/32B) keys
+    let mut des_key: Option<Vec<u8>> = None;
+    let mut aes_key: Option<Vec<u8>> = None;
+
+    for (_, key) in &extracted_keys {
+        if key.len() == 24 && des_key.is_none() {
+            des_key = Some(key.clone());
+        } else if (key.len() == 16 || key.len() == 32) && aes_key.is_none() {
+            aes_key = Some(key.clone());
+        }
+    }
+
+    let des_key = des_key.ok_or_else(|| {
+        GovmemError::PatternNotFound("Physical scan: 3DES key (24 bytes) not found".to_string())
+    })?;
+    let aes_key = aes_key.ok_or_else(|| {
+        GovmemError::PatternNotFound("Physical scan: AES key (16/32 bytes) not found".to_string())
+    })?;
+
+    // Resolve IV: try pattern-based RIP-relative addresses
+    // The IV may be on a different .data page that's accessible even when key globals aren't
+    let pe = PeHeaders::parse_from_memory(vmem, lsasrv_base)?;
+    let text = pe
+        .find_section(".text")
+        .ok_or_else(|| GovmemError::PatternNotFound(".text section in lsasrv.dll".to_string()))?;
+    let text_base = lsasrv_base + text.virtual_address as u64;
+    let text_size = text.virtual_size;
+
+    let pattern_result = patterns::find_pattern(
+        vmem,
+        text_base,
+        text_size,
+        patterns::LSASRV_KEY_PATTERNS,
+        "lsasrv_key_init",
+    );
+
+    let mut iv: Option<Vec<u8>> = None;
+    if let Ok((pattern_addr, _)) = pattern_result {
+        for &(iv_off, _, _) in KEY_OFFSET_SETS {
+            if let Ok(iv_addr) = patterns::resolve_rip_relative(vmem, pattern_addr, iv_off) {
+                if let Ok(iv_data) = vmem.read_virt_bytes(iv_addr, 16) {
+                    if iv_data.iter().any(|&b| b != 0) {
+                        log::info!(
+                            "Physical scan: IV at 0x{:x}: {}",
+                            iv_addr,
+                            hex::encode(&iv_data)
+                        );
+                        iv = Some(iv_data);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // If IV not found via pattern, try scanning .data for IV-like data near UUUR handle VAs
+    if iv.is_none() {
+        if let Some(data_sec) = pe.find_section(".data") {
+            let data_base = lsasrv_base + data_sec.virtual_address as u64;
+            let data_size = data_sec.virtual_size as usize;
+            if let Ok(data) = vmem.read_virt_bytes(data_base, data_size) {
+                // Find earliest non-zero 16-byte region that looks like random data (not a pointer)
+                for off in (0..data_size.saturating_sub(16)).step_by(8) {
+                    let candidate = &data[off..off + 16];
+                    if candidate.iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    let val = u64::from_le_bytes(candidate[0..8].try_into().unwrap());
+                    if val > 0x10000 && (val >> 48 == 0 || val >> 48 == 0xFFFF) && val & 0x7 == 0 {
+                        continue; // looks like a pointer
+                    }
+                    let val2 = u64::from_le_bytes(candidate[8..16].try_into().unwrap());
+                    if val2 > 0x10000 && (val2 >> 48 == 0 || val2 >> 48 == 0xFFFF) && val2 & 0x7 == 0 {
+                        continue;
+                    }
+                    let unique: std::collections::HashSet<u8> = candidate.iter().copied().collect();
+                    if unique.len() < 4 {
+                        continue;
+                    }
+                    log::info!(
+                        "Physical scan: IV candidate at .data+0x{:x}: {}",
+                        off,
+                        hex::encode(candidate)
+                    );
+                    iv = Some(candidate.to_vec());
+                    break;
+                }
+            }
+        }
+    }
+
+    let iv = iv.ok_or_else(|| {
+        GovmemError::PatternNotFound(
+            "Physical scan: IV not found (all .data pages paged out)".to_string(),
+        )
+    })?;
+
+    log::info!(
+        "Crypto keys extracted via physical UUUR scan: 3DES={} bytes, AES={} bytes",
+        des_key.len(),
+        aes_key.len()
+    );
+
+    Ok(CryptoKeys { iv, des_key, aes_key })
 }
 
 fn tag_to_str(tag: u32) -> String {

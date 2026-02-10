@@ -124,7 +124,20 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         .unwrap_or(0);
     log::info!("Windows build number: {}", build_number);
 
-    let keys = crypto::extract_crypto_keys(&lsass_vmem, lsasrv.base, lsasrv.size)?;
+    let keys = match crypto::extract_crypto_keys(&lsass_vmem, lsasrv.base, lsasrv.size) {
+        Ok(k) => k,
+        Err(e) => {
+            log::info!("Standard crypto extraction failed: {}", e);
+            log::info!("Trying physical UUUR scan for BCRYPT handles...");
+            crypto::extract_crypto_keys_physical_scan(
+                phys,
+                &lsass_vmem,
+                lsass.dtb,
+                lsasrv.base,
+                lsasrv.size,
+            )?
+        }
+    };
 
     // Extract credentials from each provider, tracking status for summary
     let mut all_creds: std::collections::HashMap<u64, Credential> = std::collections::HashMap::new();
