@@ -277,7 +277,7 @@ fn walk_session_buckets(
                 .read_win_unicode_string(current + offsets.domain)
                 .unwrap_or_default();
 
-            if !username.is_empty() && luid != 0 {
+            if is_plausible_luid(luid) && is_plausible_username(&username) {
                 let (logon_type, session_id, logon_time, logon_server, sid) =
                     extract_session_metadata(vmem, current, offsets);
                 let info = MsvSessionInfo {
@@ -333,7 +333,7 @@ fn walk_session_list(
             .read_win_unicode_string(current + offsets.domain)
             .unwrap_or_default();
 
-        if !username.is_empty() && luid != 0 {
+        if is_plausible_luid(luid) && is_plausible_username(&username) {
             let (logon_type, session_id, logon_time, logon_server, sid) =
                 extract_session_metadata(vmem, current, offsets);
             let info = MsvSessionInfo {
@@ -354,6 +354,34 @@ fn walk_session_list(
             Err(_) => break,
         };
     }
+}
+
+/// Validate that a LUID value looks like a real Windows logon session LUID.
+/// Windows LUIDs are 64-bit but in practice the high 32 bits are always zero
+/// for logon sessions. Well-known LUIDs: SYSTEM=0x3e7, LOCAL_SERVICE=0x3e5,
+/// NETWORK_SERVICE=0x3e4, ANONYMOUS=0x3e6. User sessions start at ~0x4000+.
+fn is_plausible_luid(luid: u64) -> bool {
+    // High 32 bits must be zero for any real logon session LUID
+    luid != 0 && (luid >> 32) == 0
+}
+
+/// Validate that a session username looks plausible (not garbage memory).
+/// Rejects strings with control characters, backslashes (file paths),
+/// or non-ASCII outside the BMP common range.
+fn is_plausible_username(name: &str) -> bool {
+    if name.is_empty() || name.len() > 256 {
+        return false;
+    }
+    // Reject file paths (e.g. "C:\Windows\system32\kerberos.DLL")
+    if name.contains('\\') || name.contains('/') {
+        return false;
+    }
+    // Reject strings with control characters (except space) or null bytes
+    if name.chars().any(|c| c < ' ' && c != '\t') {
+        return false;
+    }
+    // Require at least one ASCII alphanumeric character — real usernames have one
+    name.chars().any(|c| c.is_ascii_alphanumeric() || c == '$' || c == '-')
 }
 
 /// Insert or merge a session into the map. When re-discovering a LUID,
