@@ -49,11 +49,13 @@ All 9 SSP credential providers that mimikatz implements:
 | VMware snapshots | `.vmsn` + `.vmem` | Workstation, ESXi | Tested |
 | VirtualBox saved states | `.sav` | VirtualBox | Tested |
 | QEMU/KVM ELF core dumps | `.elf` | `virsh dump`, `dump-guest-memory` | Untested |
-| Hyper-V memory dumps | `.bin`, `.raw` | Legacy saved states, raw dumps | Untested, legacy only (no `.vmrs`) |
+| Hyper-V saved states | `.vmrs` | Hyper-V 2016+ (native parser) | Untested |
+| Hyper-V memory dumps | `.bin`, `.raw` | Legacy saved states, raw dumps | Untested |
 | VMware virtual disks | `.vmdk` (sparse + flat) | Workstation, ESXi | Tested |
 | VirtualBox virtual disks | `.vdi` | VirtualBox | Tested |
 | QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox | Tested |
 | Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V | Untested |
+| VMFS-6 raw SCSI devices | `/dev/disks/...` | ESXi datastores (bypasses file locks) | Tested |
 | LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs | Tested |
 | Raw registry hives | `SAM`, `SYSTEM`, `SECURITY` | Exported from disk or `reg save` | Tested |
 | Raw NTDS.dit | `ntds.dit` + `SYSTEM` | Copied from domain controller | Tested |
@@ -83,6 +85,15 @@ cargo build --release
 
 # Extract AD hashes from raw NTDS.dit + SYSTEM hive
 ./vmkatz ntds.dit SYSTEM
+
+# Extract from VMFS-6 on ESXi (bypasses file locks on running VMs)
+./vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'MyVM/MyVM-flat.vmdk'
+
+# List all VMs on a VMFS-6 datastore
+./vmkatz --vmfs-device /dev/disks/naa.xxx --vmfs-list
+
+# Extract from all VMs on a VMFS-6 datastore
+./vmkatz --vmfs-device /dev/disks/naa.xxx
 
 # Extract AD hashes from a domain controller disk (NTDS.dit)
 ./vmkatz --ntds /dev/pve/vm-102-disk-0
@@ -222,6 +233,28 @@ esxcli system settings advanced set -o /User/execInstalledOnly -i 0
 /tmp/vmkatz /vmfs/volumes/datastore1/MyVM/MyVM-flat.vmdk
 ```
 
+## VMFS-6 Raw Device Access (ESXi)
+
+On ESXi, VMFS locks prevent reading flat VMDK files from running VMs via the mounted filesystem. VMkatz includes a self-contained VMFS-6 parser that reads directly from the raw SCSI device, bypassing file locks entirely — no `vmkfstools`, no `.sbc.sf` access, no unmounting.
+
+```bash
+# List all VMFS-6 datastores and their VMs
+/tmp/vmkatz --vmfs-list
+
+# Extract SAM/LSA from a specific VM's flat VMDK
+/tmp/vmkatz --vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc \
+            --vmdk 'DC01/DC01-flat.vmdk'
+
+# Extract NTDS.dit from a domain controller
+/tmp/vmkatz --vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc \
+            --vmdk 'DC01/DC01-flat.vmdk' --ntds
+
+# Scan all VMs on a datastore at once
+/tmp/vmkatz --vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc
+```
+
+The parser resolves the full VMFS-6 resolution chain: LVM volume header → superblock → SFD bootstrap → FDC resource → file descriptors → directory tree → file data blocks. Supports sub-blocks, pointer blocks, large file blocks, and double-indirect addressing.
+
 ## Build Features
 
 VMkatz is modular. Features can be enabled/disabled at compile time:
@@ -231,11 +264,12 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `vmware` | VMware `.vmsn`/`.vmem` snapshot support | Yes |
 | `vbox` | VirtualBox `.sav` saved-state support | Yes |
 | `qemu` | QEMU/KVM ELF core dump support | Yes |
-| `hyperv` | Hyper-V `.bin`/`.raw` dump support | Yes |
+| `hyperv` | Hyper-V `.vmrs`/`.bin`/`.raw` dump support (native `.vmrs` parser) | Yes |
 | `sam` | Disk extraction (SAM/LSA/DCC2) and disk format handlers | Yes |
 | `ntds.dit` | NTDS.dit AD extraction (`--ntds`, `--ntds-history`). Requires `sam` | Yes |
 | `carve` | Degraded extraction from partial/truncated memory (`--carve`) | Yes |
 | `dump` | Process memory dump as minidump (`--dump`) | Yes |
+| `vmfs` | VMFS-6 raw parser for ESXi SCSI devices (`--vmfs-device`). Requires `sam` | Yes |
 
 ```bash
 # Full build with everything (default)
@@ -293,13 +327,15 @@ src/
 ├── vmware/              [feature: vmware] VMware .vmsn/.vmem/.vmss layer
 ├── vbox/                [feature: vbox] VirtualBox .sav layer
 ├── qemu/                [feature: qemu] QEMU ELF core dump layer
-├── hyperv/              [feature: hyperv] Hyper-V .bin/.raw layer
+├── hyperv/              [feature: hyperv] Hyper-V .vmrs/.bin/.raw layer (native VMRS parser)
 ├── sam/                 [feature: sam] SAM/LSA/DCC2 + disk format handlers
 │   ├── mod.rs           Orchestration, types, bootkey extraction
 │   ├── partition.rs     MBR/GPT partition table parser
 │   ├── ntfs_reader.rs   NTFS MFT walker (SAM/SYSTEM/SECURITY hive discovery)
 │   ├── disk_fallbacks.rs Fallback hive search for non-standard layouts
 │   └── vmdk_scan.rs     Sparse VMDK descriptor + extent parser
+├── disk/
+│   └── vmfs.rs          [feature: vmfs] VMFS-6 raw parser (LVM → SFD → FDC → FD → data)
 └── ntds/                [feature: ntds.dit] NTDS.dit ESE database parser
     ├── mod.rs           ESE page/B+ tree traversal, PEK decryption, hash extraction
     └── ese.rs           JET Blue database primitives (pages, tags, columns)
@@ -307,7 +343,7 @@ src/
 
 ## Tested Targets
 
-Tested across 7 Windows versions and 4 hypervisors.
+Tested across 7 Windows versions and 5 hypervisors/platforms.
 
 | Hypervisor | Guest OS | Artifact | Result | Notes |
 | --- | --- | --- | --- | --- |
@@ -332,16 +368,20 @@ Tested across 7 Windows versions and 4 hypervisors.
 | Proxmox 8 | Windows Server 2025 x64 | SAM / LSA (LVM block device) | PASS | |
 | Proxmox 8 | Windows Server 2025 x64 | NTDS.dit (LVM block device) | PASS | 32KB pages, native ESE parsing |
 | Proxmox 8 | Windows 11 x64 | SAM / LSA (LVM block device) | PASS | Live VM |
+| ESXi 8.0 | Windows Server 2012 x64 | SAM / LSA / DCC2 (VMFS-6 raw) | PASS | Running VM, file locks bypassed |
+| ESXi 8.0 | Windows Server 2016 x64 | SAM / LSA / DCC2 (VMFS-6 raw) | PASS | Running VM |
+| ESXi 8.0 | Windows Server 2019 x64 | SAM / LSA / DCC2 (VMFS-6 raw) | PASS | Running VM |
+| ESXi 8.0 | Windows 11 x64 | SAM (VMFS-6 raw) | PASS | Running VM |
 
 ### Known limitations
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works when the VM is powered off.
 - **Kerberos**: Kerberos credentials are frequently paged out in VM snapshots. The provider reports `paged` but the data is legitimately absent from RAM. Pagefile resolution (`--disk`) can recover some entries.
-- **Hyper-V**: Only legacy memory dumps (`.bin`, `.raw`) are supported via identity-mapped reading. Modern Hyper-V 2016+ saved states (`.vmrs`) use a proprietary undocumented format requiring Microsoft's `vmsavedstatedumpprovider.dll` and are not supported. VHDX/VHD disk extraction is implemented but untested. QEMU/KVM ELF core dumps are implemented but also untested.
+- **Hyper-V**: Modern `.vmrs` saved states (Hyper-V 2016+) are supported via a native parser reverse-engineered from `vmsavedstatedumpprovider.dll` — no Microsoft DLL needed. Legacy `.bin`/`.raw` dumps are also supported via identity-mapped reading. VHDX/VHD disk extraction is implemented but untested. QEMU/KVM ELF core dumps are implemented but also untested.
 - **x86 (32-bit) guests**: Partial support — WinXP SP3 and Win2003 SP2 (x86 PAE) are supported for LSASS extraction. Later 32-bit versions (Vista/Win7 x86) are not yet supported.
 
 ## How It Works
 
-1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, Hyper-V identity map) is abstracted behind a common `PhysicalMemory` trait.
+1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, Hyper-V identity map, Hyper-V VMRS key-value store with LZNT1 decompression) is abstracted behind a common `PhysicalMemory` trait.
 
 2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 13 known offset tables (WinXP SP3 through Win11 24H2, x86 PAE + x64).
 
@@ -349,7 +389,7 @@ Tested across 7 Windows versions and 4 hypervisors.
 
 4. **LSASS extraction**: Locates `lsass.exe`, maps its virtual address space, finds DLLs (`lsasrv.dll`, `msv1_0.dll`, `wdigest.dll`, `kerberos.dll`, `dpapisrv.dll`, etc.) via PEB/LDR enumeration, resolves crypto keys via pattern matching on `.text`/`.data` sections, and decrypts credentials in-memory using 3DES-CBC, AES-CBC, AES-CFB, DES-X-CBC, or RC4 (auto-detected by buffer alignment and OS version). Also works on LSASS minidumps (`.dmp`).
 
-5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key.
+5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD, LVM block devices), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key. On ESXi, a native VMFS-6 parser reads flat VMDKs directly from raw SCSI devices, bypassing filesystem locks on running VMs.
 
 6. **NTDS extraction**: For domain controllers (`--ntds`), locates `NTDS.dit` and the `SYSTEM` hive on disk, then parses the ESE (JET Blue) database natively. Traverses B+ trees to read the `datatable`, extracts the PEK (Password Encryption Key) using the bootkey, and decrypts NT/LM hashes for every AD account. Supports both 8KB pages (Windows Server 2019 and earlier) and 32KB large pages (Windows Server 2025), as well as RC4 (legacy), AES pre-Win2016, and AES Win2016+ (v0x13) hash blob formats.
 
